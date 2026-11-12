@@ -84,7 +84,7 @@ export function createProviders(env = process.env) {
       const frames = await Promise.all(selected.map(async m => ({ id: m.id, data: `data:${m.mime};base64,${(await readFile(mediaPath(m.filename))).toString('base64')}` })));
       return vision(frames);
     },
-    async reconstruct(draft, mediaPath, onCreating) {
+    async reconstruct(draft, mediaPath, onCreating, onUploaded = () => {}) {
       if (!reconstructionEnabled) throw Object.assign(new Error('尚未配置 Aholo 重建服务。'), { status: 503 });
       const inputs = reconstructionInput(draft.media);
       const asset = createAssetClient({ apiKey: env.AHOLO_API_KEY, baseUrl: base, region: 'cn', timeoutMs: 30000 });
@@ -92,6 +92,7 @@ export function createProviders(env = process.env) {
       for (const m of inputs) {
         const uploaded = await asset.uploadFile(mediaPath(m.filename), { signal: AbortSignal.timeout(180000) });
         resources.push({ url: uploaded.url, type: m.kind === 'video' ? 'video' : 'image' });
+        onUploaded(resources.length);
       }
       onCreating();
       const response = await fetch(`${base}/world/v1/reconstructions`, {
@@ -100,7 +101,12 @@ export function createProviders(env = process.env) {
         body: JSON.stringify({ name: `${draft.property} ${draft.room}`, resources, scene: 'space', taskQuality: 'low', useMask: false }),
       });
       if (!response.ok) {
-        throw Object.assign(new Error(`平台创建请求返回 ${response.status}。`), { rejected: response.status >= 400 && response.status < 500 });
+        const payload = await response.json().catch(() => null);
+        const bizCode = payload?.details?.metaData?.bizCode;
+        let diagnostic = `Aholo 创建请求返回 HTTP ${response.status}。`;
+        if (String(bizCode) === '11003') diagnostic = 'Aholo 平台额度不足。';
+        else if ([401, 403].includes(response.status)) diagnostic = 'Aholo 凭据或权限校验失败。';
+        throw Object.assign(new Error(diagnostic), { rejected: response.status >= 400 && response.status < 500, diagnostic });
       }
       const data = await response.json();
       if (!/^[a-zA-Z0-9_-]{5,80}$/.test(data.worldId || '')) throw new Error('平台没有返回有效任务编号。');
@@ -116,7 +122,9 @@ export function createProviders(env = process.env) {
       const initialView = data.status === 'SUCCEEDED' && (spz || ply)
         ? await readAholoInitialView({ origin: 'https://studio.aholo3d.cn', projectId: worldId })
         : undefined;
-      return { status: data.status, progress: typeof data.progress === 'number' ? Math.min(1, Math.max(0, data.progress)) : null, ply, spz, upAxis: data.assets?.semanticsMetadata?.upAxis || 'Z', initialView };
+      const errorCode = String(data.errorCode ?? '');
+      return { status: data.status, progress: typeof data.progress === 'number' ? Math.min(1, Math.max(0, data.progress)) : null, ply, spz,
+        upAxis: data.assets?.semanticsMetadata?.upAxis || 'Z', initialView, errorCode: /^[A-Za-z0-9_-]{1,40}$/.test(errorCode) ? errorCode : null };
     },
   };
 }

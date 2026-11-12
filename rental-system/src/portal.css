@@ -32,6 +32,12 @@
 .tenant-booking { max-width: 740px; }
 .tenant-assets { margin-top: 18px; }
 .tenant #tenant-furnishing .panel { min-width: 0; }
+.tenant-room-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 18px; }
+.tenant-room img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; border-radius: 10px; margin-bottom: 12px; }
+.listing-room { display: grid; gap: 9px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 12px; }
+.portal-form .listing-checkbox { display: flex; align-items: flex-start; gap: 7px; }
+.portal-form .listing-checkbox input { width: auto; }
+#manage-viewing { margin-top: 16px; }
 @media (max-width: 720px) {
   .tenant-bar { padding: 14px; font-size: .88rem; }
   .tenant-main { width: calc(100% - 28px); }

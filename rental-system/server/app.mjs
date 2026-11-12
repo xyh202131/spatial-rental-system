@@ -11,6 +11,7 @@ import { createSampleImports, MAX_MODEL_BYTES, parseProjectLink } from './sample
 import { createSampleSettings } from './sample-settings.mjs';
 import { createFurnishing } from './furnishing.mjs';
 import { createListings } from './listings.mjs';
+import { prepareDemoScenes } from './demo-scenes.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_MEDIA = 50 * 1024 * 1024;
@@ -78,7 +79,8 @@ export function createApp(options = {}) {
   const store = openStore(options.dataDir || join(root, '.data'), options);
   const { db } = store;
   const providers = options.providers || createProviders(env);
-  const samples = createSampleCatalog(options.samplesRoot || join(root, 'outputs', 'aholo'), options.sampleDir);
+  const demoDir = !options.samplesRoot || options.syntheticDemo ? prepareDemoScenes(join(store.dir, 'demo-v1')) : undefined;
+  const samples = createSampleCatalog(options.samplesRoot || join(root, 'outputs', 'aholo'), options.sampleDir, demoDir);
   const imports = createSampleImports(store, { fetchImpl: options.importFetch });
   const sampleSettings = createSampleSettings(store);
   const furnishing = createFurnishing(store, { samples, imports, sampleSettings, furnitureDir: options.furnitureDir });
@@ -96,6 +98,9 @@ export function createApp(options = {}) {
   const cookie = (value, clear = false) => `rental_session=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${clear ? 0 : Math.floor(sessionTTL / 1000)}${env.COOKIE_SECURE === '1' || env.PUBLIC_ORIGIN?.startsWith('https:') ? '; Secure' : ''}`;
   function ownDraft(id, user) { const found = store.draft(id, user.id); if (!found) fail(404, '采集记录不存在。'); return found; }
   function ownJob(id, user) { const job = db.prepare('SELECT j.* FROM jobs j JOIN drafts d ON d.id=j.draft_id WHERE j.id=? AND d.user_id=?').get(id, user.id); if (!job) fail(404, '任务不存在。'); return job; }
+  function acceptedReconstruction(draft, userId) {
+    return draft.jobs.some(job => job.revision === draft.revision && job.state === 'SUCCEEDED' && listings.isAccepted(userId, 'job-' + job.id));
+  }
   function requireVerified(user, revision) {
     const check = store.verification(user.id);
     if (check.status !== 'passed' || !Object.values(check.documents).every(Boolean) || (revision !== undefined && revision !== check.revision)) {
@@ -114,11 +119,17 @@ export function createApp(options = {}) {
   async function runJob(jobId, draft) {
     let creating = false;
     try {
-      const worldId = await providers.reconstruct(draft, store.mediaPath, () => { creating = true; });
-      db.prepare("UPDATE jobs SET state='RUNNING',world_id=?,updated=?,message='平台已受理，请刷新任务状态。' WHERE id=?").run(worldId, Date.now(), jobId);
+      const worldId = await providers.reconstruct(draft, store.mediaPath, () => {
+        db.prepare("UPDATE jobs SET submission_phase='create', updated=?, message='正在向 Aholo 创建重建任务。' WHERE id=?").run(Date.now(), jobId);
+        creating = true;
+      }, count => db.prepare('UPDATE jobs SET uploaded_count=?, updated=? WHERE id=?').run(count, Date.now(), jobId));
+      db.prepare("UPDATE jobs SET state='RUNNING',submission_phase='accepted',world_id=?,updated=?,message='平台已受理。' WHERE id=?").run(worldId, Date.now(), jobId);
     } catch (error) {
       const state = creating && !error.rejected ? 'UNKNOWN' : 'FAILED';
-      db.prepare('UPDATE jobs SET state=?,updated=?,message=? WHERE id=?').run(state, Date.now(), state === 'UNKNOWN' ? '创建结果不明，请先核对平台任务；本版本不会自动重复提交。' : '上传或平台受理失败，请核对服务配置、额度与素材。', jobId);
+      let message = '素材上传失败，尚未向 Aholo 创建重建任务。可重试上传。';
+      if (state === 'UNKNOWN') message = '创建结果不明，请先到平台核对任务，避免重复扣费。';
+      else if (creating) message = error.diagnostic || 'Aholo 拒绝了创建请求，请核对服务配置、额度与素材。';
+      db.prepare('UPDATE jobs SET state=?,updated=?,message=? WHERE id=?').run(state, Date.now(), message, jobId);
     }
   }
   async function route(req, res) {
@@ -144,16 +155,22 @@ export function createApp(options = {}) {
     const method = req.method;
     if (path === '/api/health' && method === 'GET') return send(res, { ok: true });
     if (path === '/api/portal/listings' && method === 'GET') return send(res, { listings: listings.list() });
-    const publicListing = /^\/api\/portal\/listings\/(demo|[a-f0-9-]{36})(?:\/(viewings|model\/([a-z0-9-]+)))?$/.exec(path);
+    const publicListing = /^\/api\/portal\/listings\/(demo|[a-f0-9-]{36})(?:\/(viewings|model|photo)(?:\/([a-z0-9-]+))?)?$/.exec(path);
     if (publicListing) {
       const [, id, operation, version] = publicListing;
-      if (!operation && method === 'GET') return send(res, { listing: listings.detail(id), furniture: listings.furniture() });
-      if (version && ['GET', 'HEAD'].includes(method)) return streamFile(req, res, listings.model(id, version), 'application/octet-stream');
-      if (operation === 'viewings' && method === 'POST') return send(res, listings.requestViewing(id, await jsonBody(req, 4096)), 201);
+      if (!operation && method === 'GET') {
+        const listing = listings.detail(id);
+        return send(res, { listing, furniture: listings.furniture(), slots: listing.scheduling ? listings.slots(id) : [] });
+      }
+      if (version && ['model', 'photo'].includes(operation) && ['GET', 'HEAD'].includes(method)) {
+        return streamFile(req, res, listings.model(id, version, operation), operation === 'photo' ? 'image/jpeg' : 'application/octet-stream');
+      }
+      if (!version && operation === 'viewings' && method === 'POST') return send(res, listings.requestViewing(id, await jsonBody(req, 4096)), 201);
       fail(405, '不支持的房源操作。');
     }
     const receipt = /^\/api\/portal\/viewings\/([a-f0-9-]{36})$/.exec(path);
-    if (receipt && method === 'GET') return send(res, listings.receipt(receipt[1]));
+    if (receipt && method === 'GET') return send(res, listings.receipt(receipt[1], req.headers['x-viewing-token']));
+    if (receipt && method === 'PATCH') return send(res, listings.manage(receipt[1], await jsonBody(req, 1024)));
     const publicFurniture = /^\/api\/portal\/furniture\/([a-z-]+)\.(glb|usdz)$/.exec(path);
     if (publicFurniture && ['GET', 'HEAD'].includes(method)) {
       const [, id, format] = publicFurniture;
@@ -188,9 +205,16 @@ export function createApp(options = {}) {
       if (path === '/api/landlord/portal' && method === 'GET') return send(res, listings.dashboard(user.id));
       if (path === '/api/landlord/listings' && method === 'POST') {
         const revision = requireVerified(user);
-        const data = await jsonBody(req, 8192);
+        const data = await jsonBody(req, 2_200_000);
         const verify = () => { auth(req); requireVerified(user, revision); };
         return send(res, { listing: await listings.publish(user.id, data, verify) }, 201);
+      }
+      const slot = /^\/api\/landlord\/listings\/([a-f0-9-]{36})\/slots$/.exec(path);
+      if (slot && method === 'PUT') {
+        const data = await jsonBody(req, 1024);
+        auth(req);
+        listings.setSlot(user.id, slot[1], data);
+        return send(res, { ok: true });
       }
       const withdraw = /^\/api\/landlord\/listings\/([a-f0-9-]{36})\/withdraw$/.exec(path);
       if (withdraw && method === 'POST') {
@@ -298,7 +322,7 @@ export function createApp(options = {}) {
       if (draftMatch) {
         const [, id, action] = draftMatch;
         let draft = ownDraft(id, user);
-        if (!action && method === 'GET') return send(res, draft);
+        if (!action && method === 'GET') return send(res, { ...draft, reconstructionAccepted: acceptedReconstruction(draft, user.id) });
         if (!action && method === 'PATCH') {
           const data = await jsonBody(req);
           db.prepare('UPDATE drafts SET notes=?,updated=? WHERE id=?').run(text(data.notes, 2000), Date.now(), id);
@@ -381,7 +405,7 @@ export function createApp(options = {}) {
         }
         if (action === 'report' && method === 'GET') {
           res.setHeader('Content-Disposition', `attachment; filename="capture-${id}.json"`);
-          return send(res, { property: draft.property, room: draft.room, revision: draft.revision, capturedAt: draft.created, review: draft.review, reviewIsCurrent: draft.review_revision === draft.revision, manualConfirmed: draft.confirmed_revision === draft.revision, reconstructionAccepted: false, media: draft.media.map(({ id, kind, purpose, captured, mime, size, parent_id, source }) => ({ id, kind, purpose, captured, mime, size, parent_id, source })), jobs: draft.jobs });
+          return send(res, { property: draft.property, room: draft.room, revision: draft.revision, capturedAt: draft.created, review: draft.review, reviewIsCurrent: draft.review_revision === draft.revision, manualConfirmed: draft.confirmed_revision === draft.revision, reconstructionAccepted: acceptedReconstruction(draft, user.id), media: draft.media.map(({ id, kind, purpose, captured, mime, size, parent_id, source }) => ({ id, kind, purpose, captured, mime, size, parent_id, source })), jobs: draft.jobs });
         }
         if (action === 'jobs' && method === 'POST') {
           const data = await jsonBody(req);
@@ -393,7 +417,8 @@ export function createApp(options = {}) {
           if (draft.jobs.some(j => j.revision === draft.revision)) fail(409, '当前素材版本已有任务，请查询原任务，不要重复提交。');
           const inputs = reconstructionInput(draft.media);
           const jobId = randomUUID(), now = Date.now();
-          db.prepare('INSERT INTO jobs (id,draft_id,revision,state,created,updated,media_ids) VALUES (?,?,?,?,?,?,?)').run(jobId, id, draft.revision, 'SUBMITTING', now, now, JSON.stringify(inputs.map(m => m.id)));
+          db.prepare("INSERT INTO jobs (id,draft_id,revision,state,created,updated,media_ids,submission_phase) VALUES (?,?,?,?,?,?,?,'upload')")
+            .run(jobId, id, draft.revision, 'SUBMITTING', now, now, JSON.stringify(inputs.map(m => m.id)));
           void runJob(jobId, draft);
           return send(res, { jobId, state: 'SUBMITTING' }, 202);
         }
@@ -426,18 +451,39 @@ export function createApp(options = {}) {
         req.verifyAccess();
         return send(res, tip);
       }
-      const jobMatch = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(refresh))?$/.exec(path);
+      const jobMatch = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(refresh|retry-upload))?$/.exec(path);
       if (jobMatch) {
         const job = ownJob(jobMatch[1], user);
+        if (method === 'POST' && jobMatch[2] === 'retry-upload') {
+          const data = await jsonBody(req, 1024);
+          const draft = ownDraft(job.draft_id, user);
+          if (!providers.reconstructionEnabled) fail(503, '重建服务尚未配置。');
+          if (data.confirmCost !== true) fail(400, '请确认重传后将继续创建重建任务。');
+          if (uploading.has(user.id)) fail(409, '素材仍在保存，请稍后重试。');
+          if (draft.revision !== job.revision || draft.confirmed_revision !== job.revision) fail(409, '素材已变更，请复查当前版本。');
+          const updated = db.prepare("UPDATE jobs SET state='SUBMITTING',uploaded_count=0,updated=?,message='' WHERE id=? AND state='FAILED' AND submission_phase='upload' AND world_id IS NULL")
+            .run(Date.now(), job.id);
+          if (!updated.changes) fail(409, '该任务需要先核对平台状态。');
+          void runJob(job.id, draft);
+          return send(res, { jobId: job.id, state: 'SUBMITTING' }, 202);
+        }
         if (method === 'POST' && jobMatch[2] === 'refresh' && job.world_id) {
           const result = await providers.status(job.world_id);
           req.verifyAccess();
           const known = ['SUCCEEDED', 'FAILED', 'RUNNING', 'PENDING', 'PREPROCESSING', 'QUEUED', 'CANCELED', 'CANCELLED', 'TIMEOUT', 'REJECTED'];
           let state = known.includes(result.status) ? result.status : 'UNKNOWN';
           if (state === 'SUCCEEDED' && !result.spz && !result.ply) state = 'ASSET_MISSING';
-          db.prepare('UPDATE jobs SET state=?,result=?,updated=?,message=? WHERE id=?').run(state, JSON.stringify(result), Date.now(), state === 'SUCCEEDED' ? '重建完成，仍需实拍对照与人工验收。' : state === 'ASSET_MISSING' ? '平台完成但尚无可用模型。' : '已更新平台状态。', job.id);
+          let message = '已更新平台状态。';
+          if (state === 'SUCCEEDED') message = '重建完成，仍需实拍对照与人工验收。';
+          else if (state === 'ASSET_MISSING') message = '平台完成但尚无可用模型，可继续刷新原任务。';
+          else if (['FAILED', 'REJECTED', 'TIMEOUT'].includes(state)) {
+            message = result.errorCode ? `Aholo 反馈错误码 ${result.errorCode}。` : 'Aholo 未返回失败原因。请检查多角度重叠、暗处和模糊画面。';
+          }
+          db.prepare('UPDATE jobs SET state=?,result=?,updated=?,message=? WHERE id=? AND updated=?')
+            .run(state, JSON.stringify(result), Date.now(), message, job.id, job.updated);
         } else if (method !== 'GET' && !(method === 'POST' && jobMatch[2] === 'refresh')) fail(405, '不支持的操作。');
-        return send(res, ownDraft(job.draft_id, user));
+        const draft = ownDraft(job.draft_id, user);
+        return send(res, { ...draft, reconstructionAccepted: acceptedReconstruction(draft, user.id) });
       }
       const sampleMatch = /^\/api\/samples\/([A-Z0-9]+)\/model\.(spz|ply)$/.exec(path);
       const legacySampleMatch = /^\/api\/sample\/model\.(spz|ply)$/.exec(path);

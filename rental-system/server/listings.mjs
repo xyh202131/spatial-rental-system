@@ -1,15 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream, mkdirSync, statSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
+import { rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { MAX_MODEL_BYTES, validateModel } from './sample-imports.mjs';
+import { createViewingSchedule, inTransaction } from './viewing-schedule.mjs';
+import { previewJpeg } from './listing-preview.mjs';
 
 const archiveId = 'ARCHIVE20260912';
 const modelHosts = new Set(['holo-cos.aholo3d.cn', 'holo-cos.aholo3d.com']);
 const demoId = 'demo';
-const requestStates = ['confirmed', 'declined'];
 const fail = (status, message) => { throw Object.assign(new Error(message), { status }); };
 
 function field(value, label, max, required = true) {
@@ -36,16 +37,26 @@ function publicationModel(room) {
   return {
     format: room.format, sceneVersion: room.sceneVersion,
     upAxis: room.upAxis, rotationX: room.rotationX, initialView: room.initialView,
-    demoOnly: room.demoOnly,
+    demoOnly: room.demoOnly, metersPerUnit: room.metersPerUnit ?? null,
   };
 }
 
-function publicListing(row) {
+function storedRooms(row) {
   const model = JSON.parse(row.model);
+  return model.rooms ?? [{ ...model, roomId: row.room_id, asset: row.asset }];
+}
+
+function publicListing(row) {
+  const details = JSON.parse(row.details);
+  const spaces = storedRooms(row).map(({ roomId, asset, photo, ...room }, index) => ({
+    ...room, id: index === 0 ? row.id : `${row.id}-${room.sceneVersion}`, title: room.label || details.title,
+    modelUrl: `/api/portal/listings/${row.id}/model/${room.sceneVersion}`,
+    previewUrl: photo ? `/api/portal/listings/${row.id}/photo/${room.sceneVersion}` : null,
+  }));
   return {
-    id: row.id, ...JSON.parse(row.details), ...model,
-    modelUrl: `/api/portal/listings/${row.id}/model/${model.sceneVersion}`,
-    acceptsViewings: true,
+    ...spaces[0], ...details, id: row.id, spaces,
+    acceptsViewings: details.listingMode !== 'showcase',
+    scheduling: details.scheduling === true,
   };
 }
 
@@ -97,23 +108,24 @@ export function createListings({ store, furnishing, samples, imports, arDir, fet
     CREATE TABLE IF NOT EXISTS portal_viewings (
       id TEXT PRIMARY KEY, listing_id TEXT NOT NULL REFERENCES portal_listings(id),
       name TEXT NOT NULL, contact TEXT NOT NULL, requested TEXT NOT NULL,
-      status TEXT NOT NULL, created INTEGER NOT NULL,
-      UNIQUE(listing_id, contact, requested)
+      status TEXT NOT NULL, created INTEGER NOT NULL, manage_hash TEXT
     );
   `);
   const active = db.prepare('SELECT * FROM portal_listings WHERE id=? AND active=1');
   const own = db.prepare('SELECT * FROM portal_listings WHERE id=? AND user_id=?');
   const byRoom = db.prepare('SELECT * FROM portal_listings WHERE user_id=? AND room_id=?');
   const publishing = new Set();
+  const schedule = createViewingSchedule(db, { detail, own });
 
   function demoListing() {
-    const model = samples.asset(archiveId, 'ply');
-    if (!model) return null;
-    const sample = samples.list().find(item => item.id === archiveId);
+    const fromArchive = Boolean(samples.asset(archiveId, 'ply'));
+    const sample = samples.list().find(item => item.id === (fromArchive ? archiveId : 'DEMOLOUNGE'));
+    if (!sample?.assets.ply) return null;
+    const sceneVersion = fromArchive ? 'archive-20260912' : 'synthetic-lounge-v1';
     return {
-      id: demoId, title: '云谷魔搭会议室', district: '浙大群核实验材料',
-      rent: null, area: null, description: '查看材料包中的三维空间，试摆盆栽与蓝色猫咪摆件。',
-      format: 'ply', modelUrl: '/api/portal/listings/demo/model/archive-20260912', sceneVersion: 'archive-20260912',
+      id: demoId, title: sample.title, district: fromArchive ? '浙大群核实验材料' : '程序生成样例',
+      rent: null, area: null, description: sample.description,
+      format: 'ply', modelUrl: `/api/portal/listings/demo/model/${sceneVersion}`, sceneVersion,
       upAxis: sample.upAxis, rotationX: sample.rotationX, initialView: sample.initialView, demoOnly: true, acceptsViewings: false,
     };
   }
@@ -129,10 +141,18 @@ export function createListings({ store, furnishing, samples, imports, arDir, fet
     return id === demoId ? row : publicListing(row);
   }
 
-  function model(id, sceneVersion) {
-    if (detail(id).sceneVersion !== sceneVersion) fail(404, '该房源模型版本已更换，请刷新页面。');
-    if (id === demoId) return samples.asset(archiveId, 'ply').path;
-    return join(directory, active.get(id).asset);
+  function model(id, sceneVersion, kind = 'model') {
+    if (id === demoId) {
+      if (kind === 'model' && detail(id).sceneVersion === sceneVersion) {
+        return samples.asset(sceneVersion === 'archive-20260912' ? archiveId : 'DEMOLOUNGE', 'ply').path;
+      }
+      fail(404, '找不到此空间文件。');
+    }
+    const row = active.get(id);
+    const room = row && storedRooms(row).find(item => item.sceneVersion === sceneVersion);
+    const file = kind === 'photo' ? room?.photo : room?.asset;
+    if (!file) fail(404, '找不到此空间文件，请刷新页面。');
+    return join(directory, file);
   }
 
   function furniture() {
@@ -157,7 +177,10 @@ export function createListings({ store, furnishing, samples, imports, arDir, fet
       WHERE l.user_id=? ORDER BY v.created DESC LIMIT 200`).all(userId);
     return {
       rooms: furnishing.rooms(userId).map(({ id, title, sceneVersion, demoOnly }) => ({ id, title, sceneVersion, demoOnly })),
-      listings: rows.map(row => ({ ...publicListing(row), roomId: row.room_id, active: Boolean(row.active), revision: row.revision })),
+      listings: rows.map(row => ({ ...publicListing(row), roomId: row.room_id, active: Boolean(row.active), revision: row.revision,
+        roomSelections: storedRooms(row).map(({ roomId, label, coverage, reviewedAt, metersPerUnit, sceneVersion, photo }) =>
+          ({ roomId, label, coverage, reviewedAt, metersPerUnit, sceneVersion, hasPreview: Boolean(photo) })),
+        slots: schedule.ownerSlots(row.id) })),
       requests,
     };
   }
@@ -167,6 +190,38 @@ export function createListings({ store, furnishing, samples, imports, arDir, fet
     const room = furnishing.room(userId, field(data.roomId, '空间成果', 96));
     if (data.sceneVersion !== room.sceneVersion) fail(409, '空间成果已更新，请重新选择后发布。');
     const old = byRoom.get(userId, room.id);
+    const previous = old ? JSON.parse(old.details) : {};
+    const previousRooms = old ? storedRooms(old) : [];
+    details.coverageNote = field(data.coverageNote ?? previous.coverageNote ?? '', '未采集区域说明', 500, false);
+    details.listingMode = data.listingMode ?? previous.listingMode ?? 'trial';
+    if (!['trial', 'showcase'].includes(details.listingMode)) fail(400, '请选择联调房源或展示样例。');
+    details.scheduling = data.scheduling ?? previous.scheduling ?? false;
+    if (typeof details.scheduling !== 'boolean') fail(400, '预约时段设置无效。');
+    const explicitRooms = data.rooms !== undefined;
+    const requested = data.rooms ?? (previousRooms.length > 1 ? previousRooms : [{ roomId: room.id, sceneVersion: room.sceneVersion }]);
+    if (!Array.isArray(requested) || requested.length < 1 || requested.length > 8 || requested[0]?.roomId !== room.id) {
+      fail(400, '请选择一个主空间，单套房源最多发布八个空间。');
+    }
+    const versions = new Set();
+    const selected = requested.map(input => {
+      const current = furnishing.room(userId, field(input?.roomId, '空间成果', 96));
+      if (current.sceneVersion !== input.sceneVersion) fail(409, '空间成果已更新，请重新选择后发布。');
+      if (versions.has(current.sceneVersion)) fail(400, '同一空间只能加入一次。');
+      versions.add(current.sceneVersion);
+      if (explicitRooms && input.reviewed !== true) fail(422, '请先验收每个空间的入口视角、画面和公开内容。');
+      const previousRoom = previousRooms.find(item => item.roomId === current.id && item.sceneVersion === current.sceneVersion);
+      const coverage = input.coverage ?? previousRoom?.coverage ?? 'unknown';
+      if (!['complete', 'partial', 'unknown'].includes(coverage)) fail(400, '采集覆盖状态无效。');
+      if (coverage === 'partial' && !details.coverageNote) fail(422, '请说明哪些区域尚未采集。');
+      if (input.preview != null && input.previewConsent !== true) fail(422, '请确认实拍图允许随房源公开。');
+      const metersPerUnit = Object.hasOwn(input, 'metersPerUnit') ? input.metersPerUnit : previousRoom?.metersPerUnit ?? null;
+      if (metersPerUnit !== null && (!Number.isFinite(metersPerUnit) || metersPerUnit < .000001 || metersPerUnit > 1000)) fail(400, '标定比例无效。');
+      return {
+        current, input, previousRoom,
+        label: field(input.label ?? previousRoom?.label ?? current.title, '房间名称', 160),
+        coverage, metersPerUnit, reviewedAt: explicitRooms ? Date.now() : previousRoom?.reviewedAt ?? null,
+      };
+    });
     if (data.revision !== (old?.revision ?? 0)) fail(409, '发布记录已修改，请刷新后重试。');
     if (!old && db.prepare('SELECT COUNT(*) AS count FROM portal_listings WHERE user_id=?').get(userId).count >= 100) {
       fail(429, '本账号已达到本地房源上限。');
@@ -174,80 +229,68 @@ export function createListings({ store, furnishing, samples, imports, arDir, fet
     const key = userId + ':' + room.id;
     if (publishing.has(key)) fail(409, '此空间正在发布，请稍候。');
     publishing.add(key);
-    let newFile;
+    const newFiles = [];
+    let committed = false;
     try {
-      const model = publicationModel(room);
       const id = old?.id || randomUUID();
-      let assetName = old?.asset;
-      if (!old || JSON.parse(old.model).sceneVersion !== room.sceneVersion) {
-        const asset = room.sourceType === 'reconstruction'
-          ? { url: room.modelUrl }
-          : samples.asset(room.sourceId, room.format) || imports.asset(room.sourceId, room.format, userId);
-        if (!asset) fail(404, '空间模型文件已丢失。');
-        assetName = randomUUID() + '.' + room.format;
-        newFile = join(directory, assetName);
-        await writeModel(asset, newFile, room.format, fetchAsset);
+      const snapshots = [];
+      for (const { current, input, previousRoom, label, coverage, metersPerUnit, reviewedAt } of selected) {
+        let asset = previousRoom?.asset;
+        if (!asset) {
+          const source = current.sourceType === 'reconstruction'
+            ? { url: current.modelUrl }
+            : samples.asset(current.sourceId, current.format) || imports.asset(current.sourceId, current.format, userId);
+          if (!source) fail(404, '空间模型文件已丢失。');
+          asset = randomUUID() + '.' + current.format;
+          const destination = join(directory, asset);
+          newFiles.push(destination);
+          await writeModel(source, destination, current.format, fetchAsset);
+        }
+        let photo = input.preview === null ? null : previousRoom?.photo ?? null;
+        if (input.preview != null) {
+          const bytes = previewJpeg(input.preview);
+          photo = randomUUID() + '.jpg';
+          const destination = join(directory, photo);
+          newFiles.push(destination);
+          await writeFile(destination, bytes, { flag: 'wx' });
+        }
+        snapshots.push({ ...publicationModel(current), roomId: current.id, label, coverage, metersPerUnit, reviewedAt, asset, photo });
       }
       verify();
-      if (furnishing.room(userId, room.id).sceneVersion !== room.sceneVersion ||
-          (byRoom.get(userId, room.id)?.revision ?? 0) !== data.revision) {
-        fail(409, '发布期间房源或空间成果发生变化，请刷新后重试。');
-      }
-      db.prepare(`INSERT INTO portal_listings(id,user_id,room_id,details,model,asset,active,revision,updated)
+      inTransaction(db, () => {
+        if ((byRoom.get(userId, room.id)?.revision ?? 0) !== data.revision ||
+            selected.some(({ current }) => furnishing.room(userId, current.id).sceneVersion !== current.sceneVersion)) {
+          fail(409, '发布期间房源或空间成果发生变化，请刷新后重试。');
+        }
+        db.prepare(`INSERT INTO portal_listings(id,user_id,room_id,details,model,asset,active,revision,updated)
         VALUES(?,?,?,?,?,?,1,?,?) ON CONFLICT(id) DO UPDATE SET details=excluded.details,model=excluded.model,
         asset=excluded.asset,active=1,revision=excluded.revision,updated=excluded.updated`)
-        .run(id, userId, room.id, JSON.stringify(details), JSON.stringify(model), assetName, data.revision + 1, Date.now());
-      newFile = null;
+          .run(id, userId, room.id, JSON.stringify(details), JSON.stringify({ rooms: snapshots }), snapshots[0].asset, data.revision + 1, Date.now());
+        if (details.listingMode === 'showcase' && previous.listingMode !== 'showcase') schedule.cancelListing(id);
+      });
+      committed = true;
       return publicListing(active.get(id));
     } finally {
       publishing.delete(key);
       // 失败时只清理本次新建的未发布快照。
-      if (newFile) await rm(newFile, { force: true });
+      if (!committed) await Promise.all(newFiles.map(path => rm(path, { force: true })));
     }
   }
 
   function withdraw(userId, id, revision) {
-    const row = own.get(id, userId);
-    if (!row) fail(404, '找不到此房源。');
-    if (row.revision !== revision) fail(409, '发布记录已修改，请刷新后重试。');
-    db.prepare('UPDATE portal_listings SET active=0, revision=revision+1, updated=? WHERE id=?').run(Date.now(), id);
+    inTransaction(db, () => {
+      const row = own.get(id, userId);
+      if (!row) fail(404, '找不到此房源。');
+      if (row.revision !== revision) fail(409, '发布记录已修改，请刷新后重试。');
+      db.prepare('UPDATE portal_listings SET active=0, revision=revision+1, updated=? WHERE id=?').run(Date.now(), id);
+      schedule.cancelListing(id);
+    });
   }
 
-  function requestViewing(id, data) {
-    if (!detail(id).acceptsViewings) fail(400, '此空间是展示样例。');
-    const name = field(data.name, '称呼', 40);
-    const contact = field(data.contact, '联系方式', 80);
-    const requested = field(data.requested, '预约时间', 16);
-    const time = Date.parse(requested + ':00+08:00');
-    const now = Date.now();
-    if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d$/.test(requested) || !Number.isFinite(time) ||
-        time <= now || time > now + 90 * 86400_000 ||
-        new Date(time + 8 * 3600_000).toISOString().slice(0, 16) !== requested) {
-      fail(400, '请选择未来 90 天内的有效北京时间。');
-    }
-    const existing = db.prepare('SELECT id FROM portal_viewings WHERE listing_id=? AND contact=? AND requested=?').get(id, contact, requested);
-    if (existing) return existing;
-    const pending = db.prepare("SELECT COUNT(*) AS count FROM portal_viewings WHERE listing_id=? AND status='pending'").get(id);
-    if (pending.count >= 100) fail(429, '此房源待处理预约已满。');
-    const request = randomUUID();
-    db.prepare('INSERT INTO portal_viewings VALUES(?,?,?,?,?,?,?)').run(request, id, name, contact, requested, 'pending', now);
-    return { id: request };
+  function isAccepted(userId, roomId) {
+    return db.prepare('SELECT room_id,model,asset FROM portal_listings WHERE user_id=? AND active=1').all(userId)
+      .some(row => storedRooms(row).some(room => room.roomId === roomId && room.reviewedAt));
   }
 
-  function respond(userId, id, status) {
-    if (!requestStates.includes(status)) fail(400, '预约处理状态无效。');
-    const row = db.prepare(`SELECT v.status FROM portal_viewings v JOIN portal_listings l ON l.id=v.listing_id
-      WHERE v.id=? AND l.user_id=?`).get(id, userId);
-    if (!row) fail(404, '找不到此预约。');
-    if (row.status !== 'pending') fail(409, '预约已经处理。');
-    db.prepare('UPDATE portal_viewings SET status=? WHERE id=?').run(status, id);
-  }
-
-  function receipt(id) {
-    const row = db.prepare('SELECT status,requested FROM portal_viewings WHERE id=?').get(id);
-    if (!row) fail(404, '找不到此预约回执。');
-    return row;
-  }
-
-  return { list, detail, model, furniture, furnitureFile, dashboard, publish, withdraw, requestViewing, respond, receipt };
+  return { list, detail, model, furniture, furnitureFile, dashboard, publish, withdraw, isAccepted, ...schedule };
 }

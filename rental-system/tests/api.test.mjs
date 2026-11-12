@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, readdir, mkdir, writeFile, unlink, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { createApp } from '../server/app.mjs';
 import { passwordHash } from '../server/store.mjs';
 import { basicReview, reconstructionInput } from '../server/providers.mjs';
+import { demoPly } from '../server/demo-scenes.mjs';
 
 const password = 'test-only-password-123';
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7N8AAAAASUVORK5CYII=', 'base64');
@@ -63,7 +65,10 @@ async function fixture(t, options = {}) {
 const archiveSamples = join(import.meta.dirname, '../outputs/aholo');
 const archiveFurniture = join(import.meta.dirname, '../materials/furniture');
 
-test('archive models, USDZ and a published room work with separated access and appointment receipts', async t => {
+const archiveReady = existsSync(join(archiveSamples, 'ARCHIVE20260912/room.ply')) &&
+  existsSync(join(archiveFurniture, 'plant.glb')) && existsSync(join(archiveFurniture, 'plant.usdz'));
+
+test('archive models, USDZ and a published room work with separated access and appointment receipts', { skip: !archiveReady }, async t => {
   const { app, user, client, restart } = await fixture(t, {
     samplesRoot: archiveSamples, furnitureDir: archiveFurniture, arDir: archiveFurniture,
   });
@@ -119,11 +124,11 @@ test('archive models, USDZ and a published room work with separated access and a
   assert.equal((await user.request(withdraw, { method: 'POST', data: { revision: 1 } })).status, 200);
   assert.equal((await tenant.request(listing.modelUrl)).status, 404);
   assert.equal((await postBooking(booking)).status, 404);
-  assert.equal((await tenant.request(receiptPath)).value.status, 'confirmed');
+  assert.equal((await tenant.request(receiptPath)).value.status, 'cancelled');
 });
 
 test('completed reconstruction publishes an independent local snapshot through the allowed CDN only', async t => {
-  const downloaded = await readFile(join(archiveSamples, 'ARCHIVE20260912/room.ply'));
+  const downloaded = demoPly();
   const calls = [];
   const { app, user, client } = await fixture(t, {
     publishFetch: async (url, options) => {
@@ -155,6 +160,76 @@ test('completed reconstruction publishes an independent local snapshot through t
   assert.ok(!JSON.stringify(published.value).includes('signature'));
   app.store.db.prepare("UPDATE jobs SET state='FAILED' WHERE id=?").run(id);
   assert.equal((await client().request(published.value.listing.modelUrl, { headers: { Range: 'bytes=0-2' } })).value.toString(), 'ply');
+});
+
+test('a reviewed multi-room listing schedules, reschedules, and cancels without double-booking', async t => {
+  const { user, client, restart } = await fixture(t, { syntheticDemo: true });
+  assert.equal((await user.verify()).status, 200);
+  const tenant = client(), another = client();
+  const { rooms } = (await user.request('/api/landlord/portal')).value;
+  const [lounge, bedroom] = ['sample-DEMOLOUNGE', 'sample-DEMOBEDROOM'].map(id => rooms.find(room => room.id === id));
+  const payload = {
+    roomId: lounge.id, sceneVersion: lounge.sceneVersion, revision: 0, title: '两房演示',
+    district: '合成样例', rent: 3200, area: 45, scheduling: true, coverageNote: '厨房尚未采集',
+    rooms: [
+      { roomId: lounge.id, sceneVersion: lounge.sceneVersion, label: '客厅', coverage: 'complete', reviewed: true },
+      { roomId: bedroom.id, sceneVersion: bedroom.sceneVersion, label: '卧室', coverage: 'partial', reviewed: false },
+    ],
+  };
+  const publish = () => user.request('/api/landlord/listings', { method: 'POST', data: payload });
+  assert.equal((await publish()).status, 422);
+  payload.rooms[1].reviewed = true;
+  const published = await publish();
+  assert.equal(published.status, 201);
+  const { listing } = published.value;
+  const endpoint = `/api/portal/listings/${listing.id}`;
+  assert.deepEqual(listing.spaces.map(room => room.title), ['客厅', '卧室']);
+  assert.equal(listing.coverageNote, '厨房尚未采集');
+  for (const room of listing.spaces) {
+    const response = await tenant.request(room.modelUrl, { headers: { Range: 'bytes=0-2' } });
+    assert.equal(response.value.toString(), 'ply');
+  }
+  const now = Date.now();
+  const time = hours => new Date(now + hours * 3_600_000).toISOString().slice(0, 16);
+  const first = time(32), second = time(34);
+  const setSlot = (requested, open = true) => user.request(`/api/landlord/listings/${listing.id}/slots`, { method: 'PUT', data: { requested, open } });
+  const book = (browser, contact, requested) => browser.request(endpoint + '/viewings', {
+    method: 'POST', data: { name: '访客', contact, requested },
+  });
+  const respond = id => user.request(`/api/landlord/viewings/${id}`, { method: 'PATCH', data: { status: 'confirmed' } });
+  assert.equal((await book(tenant, 'first@example.invalid', first)).status, 409);
+  assert.equal((await setSlot(first)).status, 200);
+  assert.equal((await setSlot(time(32.25))).status, 409);
+  assert.equal((await setSlot(second)).status, 200);
+  assert.deepEqual((await tenant.request(endpoint)).value.slots, [first, second]);
+  const a = await book(tenant, 'first@example.invalid', first);
+  const b = await book(another, 'second@example.invalid', first);
+  assert.equal(a.status, 201);
+  assert.equal(b.status, 201);
+  const confirmations = await Promise.all([respond(a.value.id), respond(b.value.id)]);
+  assert.deepEqual(confirmations.map(result => result.status).sort(), [200, 409]);
+  const winner = confirmations[0].status === 200 ? a.value : b.value;
+  const loser = winner === a.value ? b.value : a.value;
+  const receipt = `/api/portal/viewings/${winner.id}`;
+  assert.deepEqual((await tenant.request(receipt)).value, { requested: first, status: 'confirmed' });
+  const manage = (action, requested, manageToken = winner.manageToken) => tenant.request(receipt, {
+    method: 'PATCH', data: { action, requested, manageToken },
+  });
+  assert.equal((await manage('cancel', undefined, 'invalid')).status, 403);
+  assert.equal((await setSlot(first, false)).status, 409);
+  const moved = await manage('reschedule', second);
+  assert.equal(moved.value.status, 'pending');
+  assert.equal(moved.value.requested, second);
+  assert.equal((await respond(loser.id)).status, 200);
+  assert.equal((await manage('cancel')).value.status, 'cancelled');
+  const sameContact = winner === a.value ? 'first@example.invalid' : 'second@example.invalid';
+  assert.equal((await book(tenant, sameContact, second)).status, 201);
+  await restart();
+  assert.equal((await user.request(`/api/landlord/listings/${listing.id}/withdraw`, {
+    method: 'POST', data: { revision: 1 },
+  })).status, 200);
+  assert.equal((await tenant.request(`/api/portal/viewings/${loser.id}`)).value.status, 'cancelled');
+  assert.equal((await tenant.request(listing.spaces[1].modelUrl)).status, 404);
 });
 
 test('imported samples are separate authenticated assets with ranges, downloads and a fixed catalog', async t => {
@@ -387,6 +462,39 @@ test('same-version paid submission is never repeated, including ambiguous create
   assert.equal((await user.request(`/api/drafts/${draft.id}/jobs`, { method: 'POST', data: { confirmCost: true } })).status, 202);
   assert.equal((await user.request(`/api/drafts/${draft.id}/jobs`, { method: 'POST', data: { confirmCost: true } })).status, 409);
   assert.equal(calls, 1); assert.equal(app.store.db.prepare('SELECT state FROM jobs').get().state, 'UNKNOWN');
+  const job = app.store.db.prepare('SELECT id FROM jobs').get();
+  assert.equal((await user.request(`/api/jobs/${job.id}/retry-upload`, { method: 'POST', data: { confirmCost: true } })).status, 409);
+});
+
+test('an upload failure can restart the same record without duplicating the paid creation', async t => {
+  let uploads = 0, creations = 0;
+  const providers = { visionEnabled: false, reconstructionEnabled: true, review: basicReview,
+    async reconstruct(_draft, _mediaPath, creating, uploaded) {
+      if (++uploads === 1) throw new Error('test upload failure');
+      uploaded(1);
+      creating();
+      creations++;
+      return 'retry-world';
+    },
+  };
+  const { user } = await fixture(t, { providers });
+  const draft = await user.draft();
+  await user.upload(draft.id, { bytes: mp4, mime: 'video/mp4' });
+  await user.request(`/api/drafts/${draft.id}/review`, { method: 'POST', data: {} });
+  await user.request(`/api/drafts/${draft.id}/confirm`, { method: 'POST', data: { manual: true } });
+  const created = await user.request(`/api/drafts/${draft.id}/jobs`, { method: 'POST', data: { confirmCost: true } });
+  const path = `/api/jobs/${created.value.jobId}`;
+  const failed = (await user.request(path)).value.jobs[0];
+  assert.equal(failed.submission_phase, 'upload');
+  assert.equal(failed.state, 'FAILED');
+  const retry = () => user.request(path + '/retry-upload', { method: 'POST', data: { confirmCost: true } });
+  const results = await Promise.all([retry(), retry()]);
+  assert.deepEqual(results.map(item => item.status).sort(), [202, 409]);
+  const latest = (await user.request(path)).value.jobs;
+  assert.equal(latest.length, 1);
+  assert.equal(latest[0].world_id, 'retry-world');
+  assert.equal(latest[0].uploaded_count, 1);
+  assert.equal(creations, 1);
 });
 
 test('platform preprocessing is preserved and success without a model requires an asset', async t => {

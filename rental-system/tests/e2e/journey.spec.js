@@ -1,6 +1,12 @@
 import { test, expect } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 
+const sampleDir = join(import.meta.dirname, '../../outputs/aholo');
+const workbenchReady = existsSync(join(sampleDir, '3FO4K4XNH9NX/workbench.spz'));
+const meetingReady = existsSync(join(sampleDir, '3FO4K4VCF7LG/meeting-room.spz')) &&
+  existsSync(join(sampleDir, '3FO4K4VCF7LG/meeting-room.ply'));
 const action = (page, name) => page.locator(`[data-action="${name}"]`);
 async function resetAccount(page) {
   await page.evaluate(async () => {
@@ -204,6 +210,7 @@ test('mobile layout is contained and capture remains usable', async ({ page }) =
 });
 
 test('existing real SPZ sample loads and remains separate from user captures @sample', async ({ page }) => {
+  test.skip(!workbenchReady, '需要本地 Aholo 工作台模型');
   test.setTimeout(90_000);
   await login(page); await identity(page); await action(page, 'sample').first().click();
   await page.locator('[data-action="select-sample"][data-id="3FO4K4XNH9NX"]').click();
@@ -264,6 +271,7 @@ test('existing real SPZ sample loads and remains separate from user captures @sa
 });
 
 test('imported meeting room is the default, switches independently and returns to its initial point @sample', async ({ page }) => {
+  test.skip(!meetingReady || !workbenchReady, '需要本地 Aholo 会议室和工作台模型');
   test.setTimeout(90_000);
   await login(page);
   const originalDrafts = await (await page.request.get('/api/drafts')).json();
@@ -307,6 +315,7 @@ test('imported meeting room is the default, switches independently and returns t
 test.describe('touch preview', () => {
   test.use({ viewport:{ width:390, height:844 }, hasTouch:true, isMobile:true });
   test('mobile viewer exposes touch movement, presets and full screen without horizontal overflow @sample', async ({ page }) => {
+    test.skip(!meetingReady, '需要本地 Aholo 会议室模型');
     await login(page); await action(page, 'sample').first().click();
     const viewer = page.locator('#model-viewer');
     await expect(page.locator('#viewer-status')).toContainText('模型已加载', { timeout:60_000 });

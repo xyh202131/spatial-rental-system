@@ -6,7 +6,7 @@ const h = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp
 const sources = { builtin_sample: '内置样例', local_import: '导入案例', reconstruction: '重建成果' };
 const button = (command, text, extra = '') => `<button type="button" class="btn secondary small-btn" data-furnishing-command="${command}" ${extra}>${text}</button>`;
 
-export function mountFurnishing(root, { api, initialRoomId, signal, onRoomChange, onError }) {
+export function mountFurnishing(root, { api, initialRoomId, signal, onRoomChange, onError, unavailableMessage }) {
   const events = new AbortController();
   let catalog, room, layout, viewer, stage, sceneAbort, selected = '', dirty = false, saving = false, loading = true, placing = false, disposed = false;
   const $ = selector => root.querySelector(selector);
@@ -100,11 +100,15 @@ export function mountFurnishing(root, { api, initialRoomId, signal, onRoomChange
       $('#furnishing-room-title').textContent = room.title;
       $('#furnishing-source').textContent = sources[room.sourceType];
       onRoomChange(room.id);
+      const calibrated = Number.isFinite(room.metersPerUnit) && room.metersPerUnit > 0;
+      $('.furnishing-notice p').textContent = calibrated
+        ? '房间已录入比例标定。示例家具和参考地面仍需实地核对。'
+        : '本地家具试摆 · 比例示意。房间尚未标定，不能据此判断实际能否放下。';
       viewer = await mountViewer($('#furnishing-viewer'), room.modelUrl, { upAxis: room.upAxis, rotationX: room.rotationX, initialView: room.initialView, format: room.format,
         signal: sceneSignal, onStatus: text => { if (!sceneSignal.aborted) $('#furnishing-viewer-status').textContent = text; } });
       sceneSignal.throwIfAborted();
       $('#furnishing-viewer .viewer-model-tag').textContent = '房间 + 家具';
-      stage = createFurnitureStage(viewer, catalog.furniture, { signal: sceneSignal, onSelect: select,
+      stage = createFurnitureStage(viewer, catalog.furniture, { signal: sceneSignal, metersPerUnit: room.metersPerUnit, onSelect: select,
         onPlace: (placementId, point) => {
           if (loading || saving) return;
           const item = layout.placements.find(p => p.id === placementId);
@@ -123,12 +127,15 @@ export function mountFurnishing(root, { api, initialRoomId, signal, onRoomChange
       sceneSignal.throwIfAborted();
       select(layout.placements[0]?.id || '');
       if (errors.length) message(`布局已保留，但有 ${errors.length} 件家具未加载：${errors[0]}。可移除或恢复模型后重新载入。`);
-      $('#furnishing-viewer-status').textContent = '房间已载入 · 可移动查看；参考地面与家具比例均为示意';
+      $('#furnishing-viewer-status').textContent = calibrated
+        ? '房间已载入 · 可移动查看；房间比例已标定'
+        : '房间已载入 · 可移动查看；参考地面与家具比例均为示意';
     } catch (error) {
       if (!sceneSignal.aborted) {
         closeScene(); report(error);
         $('#furnishing-viewer').classList.remove('viewer-enhanced');
         $('#furnishing-viewer').innerHTML = '<div class="viewer-loading">房间未能加载，请检查本地模型后重新载入。</div>';
+        if (unavailableMessage) $('#furnishing-viewer .viewer-loading').textContent = unavailableMessage;
       }
     } finally { if (!signal.aborted && !disposed) { loading = false; renderInstances(); } }
   }
@@ -226,5 +233,6 @@ export function mountFurnishing(root, { api, initialRoomId, signal, onRoomChange
     }
     await loadRoom(catalog.rooms.find(item => item.id === initialRoomId)?.id || catalog.rooms[0].id);
   })().catch(report);
-  return { dispose, get hasUnsavedChanges() { return dirty; }, get busy() { return saving; } };
+  return { dispose, openRoom(id) { if (!loading && room?.id !== id) return loadRoom(id); },
+    get hasUnsavedChanges() { return dirty; }, get busy() { return saving; } };
 }

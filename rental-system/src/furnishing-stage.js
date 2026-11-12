@@ -17,7 +17,7 @@ function disposeModel(root) {
   images.forEach(bitmap => bitmap.close());
 }
 
-export function createFurnitureStage(viewer, furniture, { signal, onPlace, onSelect }) {
+export function createFurnitureStage(viewer, furniture, { signal, onPlace, onSelect, metersPerUnit }) {
   let disposed = false, placing = false, selected = '', pointerStart, xray = true;
   const instances = new Map(), templates = new Map();
   const points = [], packed = viewer.splat.packedSplats;
@@ -30,6 +30,7 @@ export function createFurnitureStage(viewer, furniture, { signal, onPlace, onSel
     }
   }
   const frame = roomFrame(points, viewer.bounds);
+  if (Number.isFinite(metersPerUnit) && metersPerUnit > 0) frame.unitsPerMeter = 1 / metersPerUnit;
   let floorY = frame.floorY;
   const lights = [new THREE.HemisphereLight(0xffffff, 0xa1a9b6, 2.2), new THREE.DirectionalLight(0xffffff, 2)];
   lights[1].position.set(3, 7, 4); lights.forEach(light => { light.layers.enable(1); viewer.scene.add(light); });

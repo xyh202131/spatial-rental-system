@@ -1,5 +1,6 @@
 import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { demoRooms } from './demo-scenes.mjs';
 
 const definitions = [
   {
@@ -29,18 +30,20 @@ const definitions = [
 ];
 
 // Only catalog IDs and formats resolve to files; request paths never become filesystem paths.
-export function createSampleCatalog(root, workbenchDir) {
+export function createSampleCatalog(root, workbenchDir, demoDir) {
+  const entries = demoDir ? [...definitions, ...demoRooms] : definitions;
   function asset(id, format) {
-    const entry = definitions.find(item => item.id === id);
+    const entry = entries.find(item => item.id === id);
     if (!entry || !['spz', 'ply'].includes(format)) return null;
-    const dir = entry.stem === 'workbench' && workbenchDir ? workbenchDir : join(root, entry.id);
+    const dir = entry.kind === '合成样例' ? demoDir
+      : entry.stem === 'workbench' && workbenchDir ? workbenchDir : join(root, entry.id);
     const name = `${entry.stem}.${format}`, path = join(dir, name);
     if (!existsSync(path)) return null;
     const stat = statSync(path);
     return stat.isFile() && stat.size > 0 ? { path, name } : null;
   }
   function list() {
-    return definitions.filter(entry => entry.id !== 'ARCHIVE20260912' || asset(entry.id, 'ply')).map(({ stem, ...entry }) => {
+    return entries.filter(entry => entry.id !== 'ARCHIVE20260912' || asset(entry.id, 'ply')).map(({ stem, ...entry }) => {
       const assets = Object.fromEntries(['spz', 'ply'].map(format => [format,
         asset(entry.id, format) ? `/api/samples/${entry.id}/model.${format}` : null,
       ]));

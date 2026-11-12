@@ -53,6 +53,7 @@ export function openStore(directory, options = {}) {
       id TEXT PRIMARY KEY, draft_id TEXT NOT NULL REFERENCES drafts(id), revision INTEGER NOT NULL,
       state TEXT NOT NULL, world_id TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
       message TEXT NOT NULL DEFAULT '', result TEXT, media_ids TEXT NOT NULL,
+      submission_phase TEXT NOT NULL DEFAULT 'unknown', uploaded_count INTEGER NOT NULL DEFAULT 0,
       UNIQUE(draft_id, revision)
     );
     CREATE INDEX IF NOT EXISTS drafts_owner ON drafts(user_id);
@@ -73,6 +74,9 @@ export function openStore(directory, options = {}) {
   if (!db.prepare('PRAGMA table_info(media)').all().some(column => column.name === 'source')) {
     db.exec("ALTER TABLE media ADD COLUMN source TEXT NOT NULL DEFAULT 'live-camera' CHECK(source IN ('live-camera','file-upload'))");
   }
+  const jobColumns = new Set(db.prepare('PRAGMA table_info(jobs)').all().map(column => column.name));
+  if (!jobColumns.has('submission_phase')) db.exec("ALTER TABLE jobs ADD COLUMN submission_phase TEXT NOT NULL DEFAULT 'unknown'");
+  if (!jobColumns.has('uploaded_count')) db.exec('ALTER TABLE jobs ADD COLUMN uploaded_count INTEGER NOT NULL DEFAULT 0');
   if (!db.prepare('SELECT id FROM users LIMIT 1').get()) {
     const username = options.username || 'landlord';
     const password = options.password || randomBytes(12).toString('base64url');
@@ -83,7 +87,8 @@ export function openStore(directory, options = {}) {
     }
   }
   db.prepare('DELETE FROM sessions WHERE expires < ?').run(Date.now());
-  // A request interrupted during submission cannot safely be retried automatically.
+  // 已记录尚未发出创建请求的任务可以重传，其余中断任务保留待核对。
+  db.prepare("UPDATE jobs SET state='FAILED', message='素材上传因服务中断，可重传同一批素材。' WHERE state='SUBMITTING' AND submission_phase='upload'").run();
   db.prepare("UPDATE jobs SET state='UNKNOWN', message='服务在提交过程中中断；请先核对平台任务，避免重复扣费。' WHERE state='SUBMITTING'").run();
   const mediaPath = file => join(dir, 'media', file);
   // Legacy identity_mock approvals did not include a property certificate. Never migrate them as passed.

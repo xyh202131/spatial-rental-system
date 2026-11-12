@@ -1,7 +1,7 @@
 import './style.css';
 import './portal.css';
 import { mountListings } from './landlord-listings.js';
-import { CaptureCamera } from './camera.js';
+import { CaptureCamera, frameMetrics } from './camera.js';
 import { openSampleImport } from './sample-import.js';
 
 const $ = selector => document.querySelector(selector);
@@ -225,6 +225,11 @@ async function uploadPending() {
       if (capture.owner !== state.user?.id) throw new Error('请使用拍摄时的原账号保存这些素材。');
       capture.captureId ||= newCaptureId();
       if (!capture.savedId) {
+        if (capture.source === 'file-upload' && !capture.metrics) {
+          const image = await createImageBitmap(capture.blob, { resizeWidth: 96, resizeHeight: 54 }).catch(() => null);
+          try { capture.metrics = image ? frameMetrics(image) : {}; }
+          finally { image?.close(); }
+        }
         const saved = await api(`/api/drafts/${capture.draftId}/media`, { method: 'POST', blob: capture.blob, meta: { source: capture.source || 'live-camera', captureId: capture.captureId, purpose: capture.purpose, capturedAt: capture.capturedAt, duration: capture.duration, metrics: capture.metrics } });
         capture.savedId = saved.id; state.draft = saved.draft;
       }
@@ -253,13 +258,47 @@ function renderReview() {
   <div class="review-layout"><section><div class="panel media-panel"><div class="section-heading"><h2>已采集素材 <span class="count">${countMedia()}</span></h2><select id="media-filter" aria-label="筛选素材"><option value="all">全部素材</option><option value="reconstruction" ${state.mediaFilter==='reconstruction'?'selected':''}>重建素材</option><option value="check" ${state.mediaFilter==='check'?'selected':''}>检查近照</option><option value="video-frame" ${state.mediaFilter==='video-frame'?'selected':''}>录像抽帧</option></select></div>${medias.length ? `<div class="media-grid">${medias.map(mediaCard).join('')}</div>` : '<div class="empty-inline">这里还没有素材，请先拍摄或上传照片。</div>'}<p class="small muted">检查近照不参与重建；录像抽帧仅辅助复查，不计作独立检查照片。</p></div><div class="panel notes-panel"><label for="draft-notes">现场备注 <span class="muted small">仅内部使用，默认不加入下载报告</span></label><textarea id="draft-notes" rows="3" maxlength="2000" placeholder="记录设施现状、补拍位置或需要人工确认的事项…">${h(d.notes)}</textarea>${button('save-notes', '保存备注', '', 'secondary small-btn')}</div></section>
   <aside><section class="panel guidance-panel"><div class="section-heading"><h2>${icon('scan')} 二次指导</h2><span class="badge blue">${state.config.vision ? '视觉 Agent' : '本地基础检查'}</span></div><p class="muted small">${state.config.vision ? '抽取最多 8 张照片或录像帧检查；未被抽中的部分仍需人工查看。' : '检查素材数量与粗略亮度，空间完整性由你人工确认。'}</p>${!current && d.review ? '<div class="notice warning">素材已更新，旧检查结果已失效，请重新检查。</div>' : ''}${button('run-review', current ? '重新检查当前素材' : '检查当前素材', 'scan', 'primary full', d.media.length ? '' : 'disabled')}
   ${current ? `<div class="review-summary" role="status"><strong>${h(d.review.summary)}</strong><small>${d.review.mode === 'vision' ? '视觉抽样检查' : '本地规则检查'} · ${date(d.review.checkedAt)}</small></div><div class="issue-list">${d.review.issues.map(item=>`<article class="issue"><div class="issue-title"><span class="issue-dot ${item.level==='warning'?'warn':''}"></span><h3>${h(item.title)}</h3></div><p>${h(item.evidence)}</p><div class="issue-action">${h(item.action)}</div>${item.status === 'noted' ? `<p class="note-record">已记录说明：${h(item.note)}（不代表问题已解决）</p>` : ''}<div class="issue-buttons">${item.mediaId ? button('media', '查看依据', 'eye', 'text-button', `data-id="${item.mediaId}"`) : ''}${button('reshoot', '按建议补拍', 'camera', 'text-button', `data-issue="${item.id}"`)}${button('issue-note', '记录说明', '', 'text-button', `data-issue="${item.id}"`)}</div></article>`).join('')}</div>` : '<div class="review-placeholder">检查结果将关联具体素材。<br/>需要补拍时，可以直接回到相机。</div>'}</section>
-  <section class="panel next-card"><h2>确认素材，进入成果</h2><label class="consent"><input type="checkbox" id="manual-confirm" ${d.confirmed_revision===d.revision?'checked':''}/>我已人工回看素材，并了解待补拍与无法判断的事项。</label>${button('confirm-review', '确认素材并继续', 'arrow', 'primary full', current ? '' : 'disabled')}<p class="small muted">确认采集不等于三维结果验收通过。</p></section></aside></div>`);
+  <section class="panel next-card"><h2>确认素材，进入成果</h2><label class="consent"><input type="checkbox" id="manual-confirm" ${current ? '' : 'disabled'} ${d.confirmed_revision===d.revision?'checked':''}/>我已人工回看素材，并了解待补拍与无法判断的事项。</label>${button('confirm-review', '确认素材并继续', 'arrow', 'primary full', current ? '' : 'disabled')}<p class="small muted">确认采集不等于三维结果验收通过。</p></section></aside></div>`);
 }
 const jobLabels = {
   SUBMITTING: '正在上传与提交', QUEUED: '排队中', PENDING: '等待处理', PREPROCESSING: '平台正在预处理素材', RUNNING: '平台重建中',
   SUCCEEDED: '重建完成 · 待验收', FAILED: '任务失败', CANCELED: '已取消', CANCELLED: '已取消', TIMEOUT: '平台处理超时',
   REJECTED: '平台拒绝任务', UNKNOWN: '状态待核对', ASSET_MISSING: '模型资产待处理',
 };
+const pollingJobs = new Set(['SUBMITTING', 'PENDING', 'PREPROCESSING', 'QUEUED', 'RUNNING']);
+let jobRefreshTimer;
+
+function jobSummary(job) {
+  const progress = job.state === 'SUBMITTING' && job.submission_phase === 'upload'
+    ? `素材已上传 ${job.uploaded_count} / ${job.media_ids.length}`
+    : Number.isFinite(job.result?.progress) ? `平台进度 ${Math.round(job.result.progress * 100)}%` : '';
+  const retry = job.state === 'FAILED' && job.submission_phase === 'upload' && !job.world_id && job.revision === state.draft.revision;
+  return `<div class="job-row"><div><strong>${jobLabels[job.state] || h(job.state)}</strong>
+    <p>素材版本 ${job.revision} · ${date(job.created)}${job.world_id ? ` · ${h(job.world_id)}` : ''}</p>
+    <small>${h([progress, job.message].filter(Boolean).join(' · '))}</small></div>
+    ${button('refresh-job', '刷新状态', 'refresh', 'secondary small-btn', `data-id="${job.id}"`)}
+    ${retry ? button('retry-job-upload', '重传素材并继续重建', 'refresh', 'secondary small-btn', `data-id="${job.id}"`) : ''}</div>`;
+}
+
+function watchJob(job) {
+  clearTimeout(jobRefreshTimer);
+  if (!job || !pollingJobs.has(job.state)) return;
+  const generation = renderGeneration;
+  const active = () => state.view === 'result' && generation === renderGeneration;
+  jobRefreshTimer = setTimeout(async () => {
+    if (!active()) return;
+    try {
+      const draft = await api(`/api/jobs/${job.id}/refresh`, { method: 'POST' });
+      if (!active()) return;
+      state.draft = draft;
+      renderResult();
+    } catch (error) {
+      if (!active()) return;
+      if (error.status === 401 || error.code === 'VERIFICATION_REQUIRED') return handleError(error);
+      watchJob(job);
+    }
+  }, job.state === 'SUBMITTING' ? 4000 : 12_000);
+}
 function resultPreview(job) {
   return `<section class="panel"><div class="section-heading"><h2>素材版本 ${job.revision} 三维预览${job.revision === state.draft.revision ? '' : '（补拍前）'}</h2><span class="badge blue">交互预览</span></div><div id="model-viewer" class="model-viewer"><div class="viewer-loading">正在准备三维预览…</div></div><p id="viewer-status" class="small muted" role="status">等待加载</p><div class="download-row">${button('furnishing', '送入本地试摆', 'home', 'primary', `data-room="job-${h(job.id)}"`)}${job.result.spz ? `<a class="btn secondary" href="${h(job.result.spz)}" target="_blank" rel="noopener noreferrer">${icon('download')} 下载 SPZ</a>` : ''}${job.result.ply ? `<a class="btn secondary" href="${h(job.result.ply)}" target="_blank" rel="noopener noreferrer">${icon('download')} 下载 PLY</a>` : ''}<a class="text-button" href="https://studio.aholo3d.cn/viewer?projectId=${encodeURIComponent(job.world_id)}" target="_blank" rel="noopener noreferrer">在平台查看</a>${button('listings', '发布此空间', 'arrow', 'secondary', `data-room="job-${h(job.id)}"`)}</div></section>`;
 }
@@ -268,9 +307,10 @@ function renderResult() {
   const latest = d.jobs.find(job => job.revision === d.revision), ready = latest?.state === 'SUCCEEDED' && (latest.result?.spz || latest.result?.ply);
   shell(`${heading('03 / 空间成果', '从现场记录，到空间预览', `${h(d.property)} / ${h(d.room)} · 当前采集版本 ${d.revision}`, button('review', '返回素材复查', 'eye', 'secondary'))}
   <div class="notice">${icon('info')}<p>三维成果需要结合独立检查近照人工对照，模糊、失真或未拍到的区域不视为真实现状。</p></div><div class="result-layout"><section>${ready ? resultPreview(latest) : `<div class="panel reconstruction-empty"><span class="result-cube">${icon('cube')}</span><h2>${latest ? (jobLabels[latest.state] || '任务状态待核对') : state.config.reconstruction ? '素材准备好了，开始空间重建' : '采集已保存，等待连接重建服务'}</h2><p>${latest ? h(latest.message || '当前版本已有重建任务，请在下方刷新原任务状态。') : state.config.reconstruction ? '将本次房间素材提交 Aholo，完成后在这里查看结果。' : '本机尚未配置 Aholo API Key。你可以继续采集、下载报告，或打开已有重建样例。'}</p>${button('create-job','提交空间重建','cube','primary',state.config.reconstruction && !latest?'':'disabled')}${!state.config.reconstruction ? button('sample','查看已有重建样例','arrow','text-button') : ''}<small>多图至少 20 张，或 MP4 录像。WebM 本版保留回看，不自动转码。</small></div>`}
-  ${d.jobs.length ? `<div class="panel task-panel"><h2>重建任务</h2>${d.jobs.map(j=>`<div class="job-row"><div><strong>${jobLabels[j.state] || h(j.state)}</strong><p>素材版本 ${j.revision} · ${date(j.created)}${j.world_id ? ` · ${h(j.world_id)}` : ''}</p><small>${h(j.message)}</small></div>${button('refresh-job','刷新状态','refresh','secondary small-btn',`data-id="${j.id}"`)}</div>`).join('')}</div>` : ''}
-  <div class="panel"><h2>独立检查近照</h2><p class="muted small">选择近照放大，与三维画面对应位置人工对照；视角无法对应时请标记无法比较。</p><div class="media-grid checks-grid">${d.media.filter(m=>m.purpose==='check').map(mediaCard).join('') || '<p class="empty-inline">还没有检查近照。可返回相机单独拍摄。</p>'}</div>${button('capture', '补拍检查近照', 'camera', 'secondary')}</div></section><aside><section class="panel"><span class="eyebrow">采集摘要</span><h2>${h(d.room)}</h2><dl class="summary-list"><div><dt>所属房屋</dt><dd>${h(d.property)}</dd></div><div><dt>已保存素材</dt><dd>${countMedia()} 份</dd></div><div><dt>检查状态</dt><dd>${d.review_revision===d.revision?'当前版本已检查':'需要重新检查'}</dd></div><div><dt>人工复核</dt><dd>${d.confirmed_revision===d.revision?'已记录确认':'尚未确认'}</dd></div><div><dt>重建质量</dt><dd>待人工验收</dd></div></dl><a class="btn secondary full" href="/api/drafts/${d.id}/report" download>${icon('download')} 下载采集报告</a><p class="small muted form-hint">JSON 报告保留素材清单、版本、指导和任务状态，不包含身份证图片与内部备注。</p></section></aside></div>`);
+  ${d.jobs.length ? `<div class="panel task-panel"><h2>重建任务</h2>${d.jobs.map(jobSummary).join('')}</div>` : ''}
+  <div class="panel"><h2>独立检查近照</h2><p class="muted small">选择近照放大，与三维画面对应位置人工对照；视角无法对应时请标记无法比较。</p><div class="media-grid checks-grid">${d.media.filter(m=>m.purpose==='check').map(mediaCard).join('') || '<p class="empty-inline">还没有检查近照。可返回相机单独拍摄。</p>'}</div>${button('capture', '补拍检查近照', 'camera', 'secondary')}</div></section><aside><section class="panel"><span class="eyebrow">采集摘要</span><h2>${h(d.room)}</h2><dl class="summary-list"><div><dt>所属房屋</dt><dd>${h(d.property)}</dd></div><div><dt>已保存素材</dt><dd>${countMedia()} 份</dd></div><div><dt>检查状态</dt><dd>${d.review_revision===d.revision?'当前版本已检查':'需要重新检查'}</dd></div><div><dt>人工复核</dt><dd>${d.confirmed_revision===d.revision?'已记录确认':'尚未确认'}</dd></div><div><dt>重建质量</dt><dd>${d.reconstructionAccepted ? '已记录发布验收' : '待人工验收'}</dd></div></dl><a class="btn secondary full" href="/api/drafts/${d.id}/report" download>${icon('download')} 下载采集报告</a><p class="small muted form-hint">JSON 报告保留素材清单、版本、指导和任务状态，不包含身份证图片与内部备注。</p></section></aside></div>`);
   if (ready) loadViewer(latest.result.spz || latest.result.ply, latest.result.upAxis, latest.result.initialView);
+  watchJob(latest);
 }
 function renderSample() {
   const samples = state.config.samples || [];
@@ -301,7 +341,7 @@ function renderFurnishing() {
   }).catch(error => { if (!abort.signal.aborted) handleError(error); });
 }
 function renderListings() {
-  shell(heading('房源与预约', '发布三维房源', '将一个空间成果发布到租客端，集中处理看房预约。') + '<div id="listings-root"></div>');
+  shell(heading('房源与预约', '发布三维房源', '验收各房间的展示内容，发布房源并安排看房。') + '<div id="listings-root"></div>');
   const controller = new AbortController();
   viewerAbort = controller;
   mountListings($('#listings-root'), {
@@ -481,8 +521,24 @@ async function action(name, el) {
   }
   if (name === 'run-review') {
     if (state.config.vision && !confirm('将最多 8 张房屋照片或录像帧发送到已配置的视觉服务进行检查，可能消耗服务额度。继续？')) return;
-    el.disabled=true; el.textContent='正在检查…';
-    try { state.draft=await api(`/api/drafts/${state.draft.id}/review`,{method:'POST',data:{allowExternal:state.config.vision}}); renderReview(); } finally { if(el.isConnected){el.disabled=false;el.textContent='重新检查';} } return;
+    const generation = renderGeneration;
+    const controls = [el, $('#manual-confirm'), $('[data-action="confirm-review"]')].map(control => [control, control.disabled]);
+    const label = el.textContent;
+    controls.forEach(([control]) => { control.disabled = true; });
+    el.textContent = '正在检查…';
+    try {
+      const draft = await api(`/api/drafts/${state.draft.id}/review`, { method: 'POST', data: { allowExternal: state.config.vision } });
+      if (state.view === 'review' && generation === renderGeneration) {
+        state.draft = draft;
+        renderReview();
+      }
+    } finally {
+      if (el.isConnected) {
+        controls.forEach(([control, disabled]) => { control.disabled = disabled; });
+        el.textContent = label;
+      }
+    }
+    return;
   }
   if (name === 'reshoot') { state.target=state.draft.review.issues.find(i=>i.id===el.dataset.issue)?.action||''; return navigate('capture'); }
   if (name === 'issue-note') {
@@ -499,6 +555,11 @@ async function action(name, el) {
     await api(`/api/drafts/${state.draft.id}/jobs`,{method:'POST',data:{confirmCost:true}}); return navigate('result',state.draft.id);
   }
   if (name === 'refresh-job') { state.draft=await api(`/api/jobs/${el.dataset.id}/refresh`,{method:'POST'}); return navigate('result'); }
+  if (name === 'retry-job-upload') {
+    if (!confirm('重传会在素材成功上传后继续创建重建任务，并可能消耗平台额度。继续？')) return;
+    await api(`/api/jobs/${el.dataset.id}/retry-upload`, { method: 'POST', data: { confirmCost: true } });
+    return navigate('result', state.draft.id);
+  }
   if (name === 'reset-view') return state.viewer?.reset();
 }
 document.addEventListener('click', event => {
