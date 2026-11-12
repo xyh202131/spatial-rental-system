@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f8fb">
+  <title>空间智能 · 房东采集台</title>
+  <link rel="stylesheet" href="./cover.css">
+  <script defer src="./cover.js"></script>
+</head>
+<body>
+  <main class="cover" id="cover" data-phase="0">
+    <div class="art" aria-hidden="true">
+      <img src="./assets/artwork.png" width="1672" height="941" alt="">
+      <canvas id="effects"></canvas>
+    </div>
+    <section class="intro" aria-labelledby="title">
+      <h1 id="title">空间智能<span>房东采集台</span></h1>
+      <p id="description">从现场采集到三维重建，再到家具试摆。</p>
+      <div class="controls">
+        <a class="open cover-entry" href="/tenant">租客看房</a>
+        <a class="open cover-entry" href="/landlord">房东采集台</a>
+        <button class="open" id="open-scene" type="button" aria-haspopup="dialog">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 9 5v10l-9 5-9-5V7l9-5Zm0 10 9-5m-9 5L3 7m9 5v10"/></svg>
+          查看三维样例
+        </button>
+        <button class="pause" id="pause" type="button" aria-label="暂停动效" title="暂停动效">
+          <svg class="pause-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5v14m6-14v14"/></svg>
+          <svg class="play-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 11 7-11 7V5Z"/></svg>
+        </button>
+      </div>
+    </section>
+
+    <nav class="timeline" aria-label="封面章节">
+      <button type="button" data-phase-button="0" aria-pressed="true">现场采集</button>
+      <button type="button" data-phase-button="1" aria-pressed="false">空间重建</button>
+      <button type="button" data-phase-button="2" aria-pressed="false">家具试摆</button>
+    </nav>
+
+    <dialog id="scene" aria-labelledby="scene-title">
+      <header class="scene-header">
+        <div>
+          <h2 id="scene-title">会议室 · 3DGS 样例</h2>
+          <p>拖动环视，滚轮或双指缩放。方向键也可转动视角。</p>
+        </div>
+        <button type="button" id="close-scene">返回封面</button>
+      </header>
+      <div id="scene-view" class="scene-view"></div>
+      <p class="scene-status" id="scene-status" role="status"></p>
+    </dialog>
+  </main>
+</body>
+</html>

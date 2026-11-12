@@ -1,0 +1,43 @@
+.portal-management { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 18px; }
+.portal-form { display: grid; gap: 12px; }
+.portal-form label { display: grid; gap: 5px; font-size: .9rem; }
+.portal-form input, .portal-form select, .portal-form textarea { width: 100%; }
+.portal-form > .btn { justify-self: start; }
+.portal-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.portal-row { border-top: 1px solid var(--line); padding: 13px 0; }
+.portal-row p { margin: .3rem 0 .65rem; overflow-wrap: anywhere; }
+.portal-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.tenant { background: #f6f8fb; }
+.tenant-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 14px max(24px, calc((100vw - 1240px) / 2)); background: var(--surface); border-bottom: 1px solid var(--line); }
+.tenant-bar a { text-decoration: none; }
+.tenant-brand { color: var(--blue-dark); font-weight: 750; }
+.tenant-bar nav { display: flex; flex-wrap: wrap; gap: 4px; }
+.tenant-bar nav a { padding: 8px 11px; border-radius: 8px; color: var(--muted); }
+.tenant-bar nav a:hover, .tenant-bar nav a[aria-current] { color: var(--blue-dark); background: var(--blue-light); }
+.tenant-bar nav a[aria-current] { font-weight: 650; }
+.tenant-main { width: min(1240px, calc(100% - 44px)); margin: 26px auto 60px; }
+.tenant-hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, .87fr); align-items: center; gap: clamp(20px, 4vw, 52px); padding: clamp(22px, 4vw, 48px); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.tenant-hero-art { display: block; width: 100%; height: auto; aspect-ratio: 1.65; border-radius: 12px; object-fit: cover; object-position: right center; }
+.tenant-hero h1, .tenant-detail h1 { font-size: clamp(1.9rem, 4.1vw, 3.8rem); line-height: 1.16; margin: 0 0 15px; letter-spacing: -.04em; }
+.tenant-hero h1 { font-size: clamp(1.9rem, 3.25vw, 3.05rem); text-wrap: balance; }
+.tenant-hero p { max-width: 420px; margin: 0 0 22px; color: var(--muted); }
+.tenant-catalog { margin-top: 32px; }
+.tenant-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 15px; align-items: start; }
+.tenant-card { margin: 0; }
+.tenant-card h3 { font-size: 1.36rem; margin: 0 0 10px; }
+.tenant-card h3 a, .tenant-back { color: var(--blue-dark); }
+.tenant-kind { color: var(--blue); font-weight: 700; margin: 0 0 10px; }
+.tenant-card p, .tenant-detail p { overflow-wrap: anywhere; }
+.tenant-detail { margin: 21px 0; }
+.tenant-booking { max-width: 740px; }
+.tenant-assets { margin-top: 18px; }
+.tenant #tenant-furnishing .panel { min-width: 0; }
+@media (max-width: 720px) {
+  .tenant-bar { padding: 14px; font-size: .88rem; }
+  .tenant-main { width: calc(100% - 28px); }
+  .tenant-hero, .portal-management, .portal-fields { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 580px) {
+  .sidebar nav { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); min-width: 0; gap: 4px; }
+  .sidebar .btn.nav { flex-direction: column; justify-content: center; width: 100%; min-width: 0; min-height: 44px; padding: 4px 1px; gap: 3px; line-height: 1.2; white-space: normal; }
+}

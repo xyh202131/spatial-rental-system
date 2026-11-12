@@ -1,0 +1,14 @@
+# Local reconstruction exports and preview captures
+/outputs/
+/materials/
+/public/cover/assets/scene-data.js
+/public/cover/assets/scene.bundle.js
+
+# Application runtime, credentials and generated files
+/.data/
+/.env
+/node_modules/
+/dist/
+/test-results/
+/playwright-report/
+/.firecrawl/
